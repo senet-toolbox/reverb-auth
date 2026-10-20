@@ -44,6 +44,25 @@ pub const Config = struct {
     oauth_nonce_cookie_name: []const u8 = "keystone_oauth_nonce",
     secure_cookies: bool = false,
     http_only_cookies: bool = true,
+    on_sign_in: ?SignInHook = null,
+};
+
+/// Called on the request's thread after a provider vouched for a user, at
+/// sign-in and at each refresh. Returns the id the session is issued for,
+/// usually the app's own user id, allocated from `allocator` (the request's
+/// memory). An error refuses the sign-in.
+pub const SignInHook = *const fn (allocator: std.mem.Allocator, user: SignedIn) anyerror![]const u8;
+
+/// A user as the provider describes them.
+pub const SignedIn = struct {
+    provider: OauthProvider,
+    /// The provider's id for the user (Google's `sub`). Stable; an email
+    /// address can change hands.
+    subject: []const u8,
+    email: []const u8,
+    email_verified: bool,
+    name: ?[]const u8 = null,
+    picture: ?[]const u8 = null,
 };
 
 pub const ClientConfig = struct {
@@ -52,6 +71,8 @@ pub const ClientConfig = struct {
     redirect_uri: ?[]const u8 = null,
     grant_type: ?[]const u8 = null,
     state: ?[]const u8 = null,
+    /// Overrides the provider's token endpoint; for tests.
+    token_url: ?[]const u8 = null,
 };
 
 pub const Clients = struct {
@@ -72,6 +93,7 @@ pub const InitConfig = struct {
     oauth_nonce_cookie_name: []const u8 = "keystone_oauth_nonce",
     secure_cookies: bool = false,
     http_only_cookies: bool = true,
+    on_sign_in: ?SignInHook = null,
 };
 
 const KeyStone = @This();
@@ -91,11 +113,11 @@ pub fn init(config: Config, allocator: std.mem.Allocator) !void {
 
     if (keystone_config.providers.google) |provider_google| {
         google_options = provider_google;
-        try google_provider.init(google_options, allocator);
+        google_provider.init(google_options);
         google_initialized = true;
     } else if (keystone_config.google_config) |legacy_google_options| {
         google_options = legacy_google_options;
-        try google_provider.init(google_options, allocator);
+        google_provider.init(google_options);
         google_initialized = true;
     } else if (keystone_config.client_ids.google != null and keystone_config.secrets.google != null) {
         const client_id = keystone_config.client_ids.google orelse return error.ClientIdNull;
@@ -106,7 +128,7 @@ pub fn init(config: Config, allocator: std.mem.Allocator) !void {
             .redirect_uri = "http://localhost:5173/auth/callback",
             .grant_type = "authorization_code",
         };
-        try google_provider.init(google_options, allocator);
+        google_provider.init(google_options);
         google_initialized = true;
     }
 
@@ -161,11 +183,11 @@ pub const OauthProvider = enum {
     azure,
 };
 
-pub fn refreshToken(provider: OauthProvider, refresh_token: []const u8) ![]const u8 {
+pub fn refreshToken(provider: OauthProvider, allocator: std.mem.Allocator, refresh_token: []const u8) ![]const u8 {
     switch (provider) {
         .google => {
             if (!google_initialized) return error.ProviderNotConfigured;
-            return try google_provider.refreshToken(refresh_token);
+            return try google_provider.refreshToken(allocator, refresh_token);
         },
         .github => {
             if (!github_initialized) return error.ProviderNotConfigured;
@@ -176,11 +198,11 @@ pub fn refreshToken(provider: OauthProvider, refresh_token: []const u8) ![]const
     return error.InValidProvider;
 }
 
-pub fn getUserInfo(provider: OauthProvider, access_token: []const u8) ![]const u8 {
+pub fn getUserInfo(provider: OauthProvider, allocator: std.mem.Allocator, access_token: []const u8) ![]const u8 {
     switch (provider) {
         .google => {
             if (!google_initialized) return error.ProviderNotConfigured;
-            return try google_provider.getUserInfo(access_token);
+            return try google_provider.getUserInfo(allocator, access_token);
         },
         .github => {
             if (!github_initialized) return error.ProviderNotConfigured;
@@ -239,20 +261,14 @@ pub const ExchangeSessionResponse = struct {
 // store refresh token in db hashed
 // set cookie with refresh token
 // compare with cookie token on request
-pub fn exchangeGoogleToken(ctx: *Context) !*Google.TokenResp {
-    ctx.parseForm() catch |err| {
-        std.log.err("{any}\n", .{err});
-        return err;
-    };
-    validateCallbackPayload(ctx) catch |err| {
-        std.log.err("{any}\n", .{err});
-        return err;
-    };
-    const auth_code = ctx.form_params.get("auth-code") orelse return error.AuthCodeNull;
+pub fn exchangeGoogleToken(ctx: *Context) !Google.TokenResp {
     if (!google_initialized) return error.ProviderNotConfigured;
-    const body: []const u8 = try google_provider.tokenExchange(auth_code);
-    const resp: *Google.TokenResp = try Google.parseResp(Google.TokenResp, body, ctx.arena);
-    return resp;
+    try ctx.parseForm();
+    try validateCallbackPayload(ctx);
+    const auth_code = ctx.form_params.get("auth-code") orelse return error.AuthCodeNull;
+    const allocator = ctx.requestAllocator();
+    const body = try google_provider.tokenExchange(allocator, auth_code);
+    return Google.parseResp(Google.TokenResp, body, allocator);
 }
 
 // Login with github
@@ -292,54 +308,28 @@ pub const GoogleClaims = struct {
     exp: i64,
 };
 
+/// Reads the id token Google's token endpoint returned.
+///
+/// Its signature is not checked: the token came straight from Google over
+/// TLS, which OpenID Connect accepts instead (Core 1.0, 3.1.3.7, step 6).
+/// Who issued it, who it is for and when it expires still are, so a token
+/// minted for another app is refused. `error.InvalidIdToken` otherwise.
 pub fn handleGoogleCallback(allocator: std.mem.Allocator, google_id_token: []const u8) !JWT.JWT(GoogleClaims) {
-    // Decode Google's id_token (skip signature verification since it came direct from Google)
-    const google_jwt = try JWT.decode(
+    return JWT.decode(
         allocator,
         GoogleClaims,
         google_id_token,
-        .{ .secret = "" }, // not used when skipping
-        .{ .skip_secret = true }, // skip RS256 verification
-    );
-    return google_jwt;
-}
-
-const GoogleAuthResponse = struct {
-    tokens: Google.TokenResp,
-    session: []const u8,
-    user: GoogleClaims,
-    jwt: JWT.JWT(GoogleClaims),
-};
-
-pub fn handleGoogleAuthFlow(ctx: *Context) !GoogleAuthResponse {
-    const resp = KeyStone.exchangeGoogleToken(ctx) catch return error.ExchangeGoogleToken;
-
-    if (resp.id_token) |token| {
-        const google_jwt = try handleGoogleCallback(ctx.arena, token);
-        const google_user = google_jwt.claims;
-        const issued_at = Time.timestamp();
-        const expires_at = issued_at + keystone_config.session_ttl_seconds;
-        const session_claims = SessionClaims{
-            .sub = google_user.sub,
-            .email = google_user.email,
-            .name = google_user.name orelse "User",
-            .iat = issued_at,
-            .exp = expires_at,
-        };
-        const session_token = try encodeSessionToken(ctx.arena, session_claims);
-        try persistSessionCookies(ctx, session_token, resp.refresh_token);
-        try clearCallbackCookies(ctx);
-
-        return GoogleAuthResponse{
-            .tokens = resp.*,
-            .session = session_token,
-            .user = google_user,
-            .jwt = google_jwt,
-        };
-    } else {
-        return error.GoogleAuthFlow;
-        // try ctx.ERROR(404, "Could not aquire google id token");
-    }
+        .{ .secret = "" },
+        .{
+            .skip_secret = true,
+            .required_claims = &.{ .exp, .iss, .aud },
+            .iss = &.{ "https://accounts.google.com", "accounts.google.com" },
+            .aud = &.{google_options.client_id},
+        },
+    ) catch |err| {
+        std.log.warn("google id token refused: {any}", .{err});
+        return error.InvalidIdToken;
+    };
 }
 
 pub const SessionClaims = struct {
@@ -351,23 +341,46 @@ pub const SessionClaims = struct {
 };
 
 pub fn exchangeGoogleCodeToSession(ctx: *Context) !AuthSessionResponse {
-    const flow = try handleGoogleAuthFlow(ctx);
-    const session_claims = try decodeSessionToken(ctx.arena, flow.session) orelse return error.InvalidSession;
+    const tokens = try exchangeGoogleToken(ctx);
+    const id_token = tokens.id_token orelse return error.MissingIdToken;
+    const google = try handleGoogleCallback(ctx.requestAllocator(), id_token);
+    const session = try startSession(ctx, google.claims, tokens.refresh_token);
+    try clearCallbackCookies(ctx);
+    return .{ .success = true, .state = .signed_in, .session = session };
+}
+
+/// Issues a session for the user Google vouched for: runs the app's
+/// `on_sign_in`, signs the session token and sets the cookies (the refresh
+/// token's too, when Google sent one).
+fn startSession(ctx: *Context, google: GoogleClaims, refresh_token: ?[]const u8) !SessionInfo {
+    const allocator = ctx.requestAllocator();
+    const user: SignedIn = .{
+        .provider = .google,
+        .subject = google.sub,
+        .email = google.email,
+        .email_verified = google.email_verified,
+        .name = google.name,
+        .picture = google.picture,
+    };
+    const user_id = if (keystone_config.on_sign_in) |hook| try hook(allocator, user) else user.subject;
+
+    const issued_at = Time.timestamp();
+    const expires_at = issued_at + keystone_config.session_ttl_seconds;
+    const name = google.name orelse "User";
+    const token = try encodeSessionToken(allocator, .{
+        .sub = user_id,
+        .email = google.email,
+        .name = name,
+        .iat = issued_at,
+        .exp = expires_at,
+    });
+    try persistSessionCookies(ctx, token, refresh_token);
     return .{
-        .success = true,
-        .state = .signed_in,
-        .session = .{
-            .token = flow.session,
-            .provider = .google,
-            .issued_at = session_claims.iat,
-            .expires_at = session_claims.exp,
-            .user = .{
-                .id = flow.user.sub,
-                .email = flow.user.email,
-                .name = flow.user.name orelse "User",
-                .picture = flow.user.picture,
-            },
-        },
+        .token = token,
+        .provider = .google,
+        .issued_at = issued_at,
+        .expires_at = expires_at,
+        .user = .{ .id = user_id, .email = google.email, .name = name, .picture = google.picture },
     };
 }
 
@@ -403,45 +416,21 @@ pub fn refreshSession(ctx: *Context) !AuthSessionResponse {
         .err = "refresh_token_missing",
     };
 
-    const body = try refreshToken(.google, refresh_token);
-    const refreshed = try Google.parseResp(Google.RefreshTokenResp, body, ctx.arena);
+    const allocator = ctx.requestAllocator();
+    const body = refreshToken(.google, allocator, refresh_token) catch |err| switch (err) {
+        // Revoked or expired: the user has to sign in again.
+        error.WrongStatusResponse => return .{ .success = false, .state = .signed_out, .err = "refresh_rejected" },
+        else => return err,
+    };
+    const refreshed = try Google.parseResp(Google.RefreshTokenResp, body, allocator);
     const id_token = refreshed.id_token orelse return .{
         .success = false,
         .state = .signed_out,
         .err = "refresh_id_token_missing",
     };
 
-    const google_jwt = try handleGoogleCallback(ctx.arena, id_token);
-    const claims = google_jwt.claims;
-
-    const issued_at = Time.timestamp();
-    const expires_at = issued_at + keystone_config.session_ttl_seconds;
-    const session_claims = SessionClaims{
-        .sub = claims.sub,
-        .email = claims.email,
-        .name = claims.name orelse "User",
-        .iat = issued_at,
-        .exp = expires_at,
-    };
-    const session_token = try encodeSessionToken(ctx.arena, session_claims);
-    try persistSessionCookies(ctx, session_token, null);
-
-    return .{
-        .success = true,
-        .state = .signed_in,
-        .session = .{
-            .token = session_token,
-            .provider = .google,
-            .issued_at = issued_at,
-            .expires_at = expires_at,
-            .user = .{
-                .id = claims.sub,
-                .email = claims.email,
-                .name = claims.name orelse "User",
-                .picture = claims.picture,
-            },
-        },
-    };
+    const google = try handleGoogleCallback(allocator, id_token);
+    return .{ .success = true, .state = .signed_in, .session = try startSession(ctx, google.claims, null) };
 }
 
 pub fn signOutSession(ctx: *Context, _: bool) !AuthSessionResponse {
@@ -454,7 +443,7 @@ pub fn signOutSession(ctx: *Context, _: bool) !AuthSessionResponse {
 
 fn validateSession(ctx: *Context) !?SessionClaims {
     const token = sessionTokenFromRequest(ctx) orelse return null;
-    return decodeSessionToken(ctx.arena, token);
+    return decodeSessionToken(ctx.requestAllocator(), token);
 }
 
 fn decodeSessionToken(allocator: std.mem.Allocator, token: []const u8) !?SessionClaims {
@@ -599,6 +588,7 @@ fn buildConfig(init_cfg: InitConfig, allocator: std.mem.Allocator) !Config {
         .oauth_nonce_cookie_name = init_cfg.oauth_nonce_cookie_name,
         .secure_cookies = init_cfg.secure_cookies,
         .http_only_cookies = init_cfg.http_only_cookies,
+        .on_sign_in = init_cfg.on_sign_in,
     };
 
     if (init_cfg.clients.google) |google_client| {
@@ -609,6 +599,7 @@ fn buildConfig(init_cfg: InitConfig, allocator: std.mem.Allocator) !Config {
             .redirect_uri = redirect_uri,
             .grant_type = google_client.grant_type orelse "authorization_code",
         };
+        if (google_client.token_url) |url| cfg.providers.google.?.token_url = url;
     }
 
     if (init_cfg.clients.github) |github_client| {
@@ -633,9 +624,21 @@ fn defaultRedirectUri(allocator: std.mem.Allocator, init_cfg: InitConfig) ![]con
 
 fn routeGoogleExchange(ctx: *Context) !void {
     const auth_resp = exchangeGoogleCodeToSession(ctx) catch |err| {
-        std.log.err("Error: {any}", .{err});
-        try ctx.ERROR(500, "Internal Server Error");
-        return;
+        std.log.err("google sign-in: {any}", .{err});
+        // Refused by Google, or by the checks on what came back: the user
+        // can try again. Anything else is the server's problem.
+        const status: u16 = switch (err) {
+            error.WrongStatusResponse,
+            error.InvalidOauthState,
+            error.InvalidOauthNonce,
+            error.OauthCallbackError,
+            error.AuthCodeNull,
+            error.MissingIdToken,
+            error.InvalidIdToken,
+            => 401,
+            else => 500,
+        };
+        return ctx.ERROR(status, "Google sign-in failed");
     };
     const session = auth_resp.session orelse return error.InvalidSession;
     try ctx.JSON(ExchangeSessionResponse, .{
@@ -709,4 +712,42 @@ pub fn requireAuth(ctx: *Context) !SessionClaims {
         try ctx.ERROR(401, "Invalid or expired session");
         return error.Unauthorized;
     };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+/// An id token as Google's token endpoint returns it. The signature is
+/// arbitrary: `handleGoogleCallback` does not check it.
+fn fakeIdToken(allocator: std.mem.Allocator, iss: []const u8, aud: []const u8, exp: i64) ![]const u8 {
+    return JWT.encode(allocator, .{ .alg = .HS256, .typ = "JWT" }, .{
+        .iss = iss,
+        .azp = aud,
+        .aud = aud,
+        .sub = "1234567890",
+        .email = "ada@example.com",
+        .email_verified = true,
+        .name = "Ada",
+        .iat = Time.timestamp(),
+        .exp = exp,
+    }, .{ .secret = "not-googles-key" });
+}
+
+test "a Google id token is accepted only for this client, from Google, unexpired" {
+    try init(.{ .providers = .{ .google = .{ .client_id = "our-client", .client_secret = "s" } } }, testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const later = Time.timestamp() + 3600;
+
+    const ok = try handleGoogleCallback(a, try fakeIdToken(a, "https://accounts.google.com", "our-client", later));
+    try testing.expectEqualStrings("1234567890", ok.claims.sub);
+    try testing.expectEqualStrings("ada@example.com", ok.claims.email);
+
+    try testing.expectError(error.InvalidIdToken, handleGoogleCallback(a, try fakeIdToken(a, "https://accounts.google.com", "someone-elses-client", later)));
+    try testing.expectError(error.InvalidIdToken, handleGoogleCallback(a, try fakeIdToken(a, "https://evil.example", "our-client", later)));
+    try testing.expectError(error.InvalidIdToken, handleGoogleCallback(a, try fakeIdToken(a, "accounts.google.com", "our-client", Time.timestamp() - 3600)));
 }

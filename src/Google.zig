@@ -9,6 +9,10 @@ pub const Options = struct {
     client_secret: []const u8,
     redirect_uri: []const u8 = "http://localhost:5173",
     grant_type: []const u8 = "authorization_code",
+    /// Where codes and refresh tokens are exchanged. Tests point it at a
+    /// fake.
+    token_url: []const u8 = "https://oauth2.googleapis.com/token",
+    userinfo_url: []const u8 = "https://openidconnect.googleapis.com/v1/userinfo",
 };
 
 pub const GoogleUserInfo = struct {
@@ -21,203 +25,132 @@ pub const GoogleUserInfo = struct {
     email_verified: bool,
 };
 
+/// Calls Google's OAuth endpoints. Holds only its options, so one provider
+/// may be used from several threads at once.
 pub const Provider = struct {
     const Self = @This();
     options: Options,
-    query: QueryBuilder,
-    arena: std.mem.Allocator,
 
-    pub fn init(
-        target: *Provider,
-        options: Options,
-        allocator: std.mem.Allocator,
-    ) !void {
-        var query: QueryBuilder = undefined;
-        try query.init(allocator);
-        target.* = .{
-            .options = options,
-            .query = query,
-            .arena = allocator,
-        };
-    }
-    pub fn deinit(self: *Self) void {
-        self.query.deinit();
+    pub fn init(target: *Provider, options: Options) void {
+        target.* = .{ .options = options };
     }
 
-    pub fn tokenExchange(google_prov: *Self, auth_code: []const u8) ![]const u8 {
-        const allocator = google_prov.arena;
-
-        try google_prov.query.add("code", auth_code);
-        try google_prov.query.add("client_id", google_prov.options.client_id);
-        try google_prov.query.add("client_secret", google_prov.options.client_secret);
-        try google_prov.query.add("redirect_uri", google_prov.options.redirect_uri);
-        try google_prov.query.add("grant_type", google_prov.options.grant_type);
-        defer google_prov.query.clear();
-
-        try google_prov.query.queryStrEncode();
-        const payload = google_prov.query.str;
-
-        const uri = try std.Uri.parse("https://oauth2.googleapis.com/token");
-
-        var threaded: std.Io.Threaded = .init_single_threaded;
-        const io = threaded.io();
-
-        var client = Client{
-            .allocator = allocator,
-            .io = io,
-            .write_buffer_size = 8192,
-        };
-        defer client.deinit(); // <-- Make sure this is here
-
-        var body = std.Io.Writer.Allocating.init(allocator);
-        // defer body.deinit();
-
-        const resp = try client.fetch(.{
-            .method = .POST,
-            .headers = .{ .content_type = .{ .override = "application/x-www-form-urlencoded" } },
-            .location = .{ .uri = uri },
-            .payload = payload,
-            .response_writer = &body.writer,
+    /// Exchanges an authorization code for tokens. Returns Google's JSON
+    /// body, owned by the caller (`parseResp(TokenResp, ...)` reads it).
+    pub fn tokenExchange(google_prov: *const Self, gpa: std.mem.Allocator, auth_code: []const u8) ![]u8 {
+        const o = google_prov.options;
+        return postForm(gpa, o.token_url, &.{
+            .{ "code", auth_code },
+            .{ "client_id", o.client_id },
+            .{ "client_secret", o.client_secret },
+            .{ "redirect_uri", o.redirect_uri },
+            .{ "grant_type", o.grant_type },
         });
-
-        if (resp.status != .ok) {
-            std.debug.print("Response body: {s}\n", .{body.written()});
-            std.debug.print("Response status: {s}\n", .{payload});
-            return error.WrongStatusResponse;
-        }
-
-        return body.written();
     }
 
-    pub fn getUserInfo(google_prov: *Self, access_token: []const u8) ![]const u8 {
-        const allocator = google_prov.arena;
-        const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{access_token});
-        defer allocator.free(authorization);
-        const uri = try std.Uri.parse("https://openidconnect.googleapis.com/v1/userinfo");
+    /// Exchanges a refresh token for a new access token (and id token).
+    /// Returns Google's JSON body, owned by the caller.
+    pub fn refreshToken(google_prov: *const Self, gpa: std.mem.Allocator, refresh_token: []const u8) ![]u8 {
+        const o = google_prov.options;
+        return postForm(gpa, o.token_url, &.{
+            .{ "client_id", o.client_id },
+            .{ "client_secret", o.client_secret },
+            .{ "refresh_token", refresh_token },
+            .{ "grant_type", "refresh_token" },
+        });
+    }
+
+    /// The signed-in user's profile. Returns Google's JSON body, owned by
+    /// the caller.
+    pub fn getUserInfo(google_prov: *const Self, gpa: std.mem.Allocator, access_token: []const u8) ![]u8 {
+        const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{access_token});
+        defer gpa.free(authorization);
 
         var threaded: std.Io.Threaded = .init_single_threaded;
-        const io = threaded.io();
-
-        var client = Client{
-            .allocator = allocator,
-            .io = io,
-            .write_buffer_size = 8192,
-        };
+        var client = Client{ .allocator = gpa, .io = threaded.io(), .write_buffer_size = 8192 };
         defer client.deinit();
 
-        var body = std.Io.Writer.Allocating.init(allocator);
+        var body: std.Io.Writer.Allocating = .init(gpa);
+        errdefer body.deinit();
         const resp = try client.fetch(.{
             .method = .GET,
-            .headers = .{
-                .authorization = .{ .override = authorization },
-                .user_agent = .{ .override = "Nightwatch" },
-            },
-            .location = .{ .uri = uri },
+            .headers = .{ .authorization = .{ .override = authorization } },
+            .location = .{ .url = google_prov.options.userinfo_url },
             .response_writer = &body.writer,
         });
-
         if (resp.status != .ok) {
-            std.debug.print("\nBody: {s}\n", .{body.written()});
-            std.debug.print("\nStatus: {any}\n", .{resp.status});
-
-            const ErrorStruct = struct {
-                @"error": []const u8,
-                error_description: []const u8,
-            };
-
-            _ = try parseResp(ErrorStruct, body.written(), allocator);
-
+            std.log.warn("google userinfo: {d} {s}", .{ @intFromEnum(resp.status), body.written() });
             return error.WrongStatusResponse;
         }
-        return body.written();
-    }
-
-    // Opening up a a http.Client.open cause slower compile time
-    pub fn refreshToken(google_prov: *Self, refresh_token: []const u8) ![]const u8 {
-        const allocator = google_prov.arena;
-        try google_prov.query.add("client_id", google_prov.options.client_id);
-        try google_prov.query.add("client_secret", google_prov.options.client_secret);
-        try google_prov.query.add("refresh_token", refresh_token); // or your actual callback URL
-        try google_prov.query.add("grant_type", "refresh_token");
-        defer google_prov.query.clear();
-        try google_prov.query.queryStrEncode();
-        const payload = google_prov.query.str;
-        const uri = try std.Uri.parse("https://oauth2.googleapis.com/token");
-
-        var threaded: std.Io.Threaded = .init_single_threaded;
-        const io = threaded.io();
-
-        var client = Client{
-            .allocator = allocator,
-            .io = io,
-            .write_buffer_size = 8192,
-        };
-        defer client.deinit();
-
-        var body = std.Io.Writer.Allocating.init(allocator);
-        const resp = try client.fetch(.{
-            .method = .POST,
-            .headers = .{ .content_type = .{ .override = "application/x-www-form-urlencoded" } },
-            .location = .{ .uri = uri },
-            .payload = payload,
-            .response_writer = &body.writer,
-        });
-
-        if (resp.status != .ok) {
-            std.debug.print("Response body: {s}\n", .{body.written()});
-            std.debug.print("Response status: {s}\n", .{payload});
-            return error.WrongStatusResponse;
-        }
-
-        return body.written();
+        return body.toOwnedSlice();
     }
 };
+
+/// POSTs `fields` form-encoded to `url` and returns the response body,
+/// owned by the caller.
+///
+/// A refusal is logged with Google's answer (`invalid_grant` and the like),
+/// never with the request: that carries the client secret and the code.
+fn postForm(gpa: std.mem.Allocator, url: []const u8, fields: []const [2][]const u8) ![]u8 {
+    var form: QueryBuilder = undefined;
+    try form.init(gpa);
+    defer form.deinit();
+    for (fields) |field| try form.add(field[0], field[1]);
+    try form.queryStrEncode();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    var client = Client{ .allocator = gpa, .io = threaded.io(), .write_buffer_size = 8192 };
+    defer client.deinit();
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    errdefer body.deinit();
+    const resp = try client.fetch(.{
+        .method = .POST,
+        .headers = .{ .content_type = .{ .override = "application/x-www-form-urlencoded" } },
+        .location = .{ .url = url },
+        .payload = form.str,
+        .response_writer = &body.writer,
+    });
+    if (resp.status != .ok) {
+        std.log.warn("google token endpoint: {d} {s}", .{ @intFromEnum(resp.status), body.written() });
+        return error.WrongStatusResponse;
+    }
+    return body.toOwnedSlice();
+}
 
 pub const TokenResp = struct {
     access_token: []const u8,
     token_type: []const u8,
     expires_in: i64,
-    refresh_token: ?[]const u8,
-    scope: ?[]const u8,
-    id_token: ?[]const u8,
+    refresh_token: ?[]const u8 = null,
+    scope: ?[]const u8 = null,
+    id_token: ?[]const u8 = null,
 };
 
 pub const RefreshTokenResp = struct {
     access_token: []const u8,
     token_type: []const u8,
     expires_in: i64,
-    scope: ?[]const u8,
-    id_token: ?[]const u8,
+    scope: ?[]const u8 = null,
+    id_token: ?[]const u8 = null,
 };
 
-pub fn parseResp(comptime T: type, body: []const u8, allocator: std.mem.Allocator) !*T {
-    const index = std.mem.indexOf(u8, body, "{").?;
-    const binded_value: *T = try allocator.create(T);
-    const parsed = json.parseFromSlice(
-        T,
-        allocator,
-        body[index..body.len],
-        .{},
-    ) catch return error.MalformedJson;
-    defer parsed.deinit();
-
-    binded_value.* = parsed.value;
-    return binded_value;
+/// Parses one of Google's JSON answers. The strings point into memory from
+/// `arena`, which should be a request arena: nothing here frees them.
+/// Fields Google adds over time are ignored.
+pub fn parseResp(comptime T: type, body: []const u8, arena: std.mem.Allocator) !T {
+    return json.parseFromSliceLeaky(T, arena, body, .{ .ignore_unknown_fields = true }) catch
+        error.MalformedJson;
 }
 
-pub const TokenResponse = struct {
-    access_token: []const u8,
-    token_type: []const u8,
-    expires_in: i64,
-    refresh_token: ?[]const u8,
-    scope: ?[]const u8,
-    id_token: ?[]const u8,
-
-    pub fn deinit(self: *const TokenResponse, allocator: std.mem.Allocator) void {
-        allocator.free(self.access_token);
-        allocator.free(self.token_type);
-        if (self.refresh_token) |rt| allocator.free(rt);
-        if (self.scope) |s| allocator.free(s);
-        if (self.id_token) |it| allocator.free(it);
-    }
-};
+test "parseResp keeps strings alive and ignores fields it does not know" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const resp = try parseResp(TokenResp,
+        \\{"access_token":"ya29.a","expires_in":3599,"token_type":"Bearer",
+        \\ "refresh_token_expires_in":604799,"id_token":"x.y.z"}
+    , arena.allocator());
+    try std.testing.expectEqualStrings("ya29.a", resp.access_token);
+    try std.testing.expectEqualStrings("x.y.z", resp.id_token.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), resp.refresh_token);
+}

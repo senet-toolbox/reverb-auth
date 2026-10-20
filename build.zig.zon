@@ -4,14 +4,12 @@
     .fingerprint = 0xbca7d9664f5c6c39,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        // A path dependency, which is not what you want long term -- it
-        // means this package cannot be built without a sibling checkout.
-        // It is a path rather than a pinned URL only because
-        // senet-toolbox/reverb is private, so `zig fetch` cannot reach it
-        // without credentials. Switch to
-        //   .url = "git+https://github.com/senet-toolbox/reverb.git#<commit>"
-        // once reverb is public, or when CI has a token to fetch with.
-        .reverb = .{ .path = "../reverb" },
+        // Pinned to the reverb an app uses with this package, so the two
+        // resolve to one reverb and share its `Context`.
+        .reverb = .{
+            .url = "git+https://github.com/senet-toolbox/reverb#7791913363101e368b6fb73046b3cdfb957ce855",
+            .hash = "reverb-0.0.0-Gtb4ydiBDADfbEkBXtyuGrM5UdqAKM04zcGVSFfiUpGP",
+        },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "LICENSE", "README.md" },
 }
