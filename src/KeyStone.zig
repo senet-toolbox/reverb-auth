@@ -3,6 +3,8 @@ pub const Google = @import("Google.zig");
 pub const Github = @import("Github.zig");
 const Context = @import("reverb").Context;
 const Cookie = @import("reverb").Cookie;
+const Reply = @import("reverb").Reply;
+const Workers = @import("reverb").Workers;
 const QueryBuilder = @import("QueryBuilder.zig");
 const JWT = @import("JWT.zig");
 const JWTRoot = @import("jwt_types.zig");
@@ -44,11 +46,12 @@ pub const Config = struct {
     oauth_nonce_cookie_name: []const u8 = "keystone_oauth_nonce",
     secure_cookies: bool = false,
     http_only_cookies: bool = true,
+    same_site: ?Cookie.SameSite = .lax,
     on_sign_in: ?SignInHook = null,
 };
 
-/// Called on the request's thread after a provider vouched for a user, at
-/// sign-in and at each refresh. Returns the id the session is issued for,
+/// Called on a sign-in worker thread after a provider vouched for a user,
+/// at sign-in and at each refresh, so it must be threadsafe. Returns the id the session is issued for,
 /// usually the app's own user id, allocated from `allocator` (the request's
 /// memory). An error refuses the sign-in.
 pub const SignInHook = *const fn (allocator: std.mem.Allocator, user: SignedIn) anyerror![]const u8;
@@ -93,7 +96,16 @@ pub const InitConfig = struct {
     oauth_nonce_cookie_name: []const u8 = "keystone_oauth_nonce",
     secure_cookies: bool = false,
     http_only_cookies: bool = true,
+    /// For the session and refresh cookies. `lax` suits a frontend on the
+    /// same site as this server (app.example.com and api.example.com);
+    /// one on another site needs `none`, which browsers honour only with
+    /// `secure_cookies`.
+    same_site: ?Cookie.SameSite = .lax,
     on_sign_in: ?SignInHook = null,
+    /// Sign-ins and refreshes wait on Google, so they run on these.
+    sign_in_threads: usize = 2,
+    /// Sign-ins that may wait for a thread; past this they answer 503.
+    sign_in_queue: usize = 16,
 };
 
 const KeyStone = @This();
@@ -153,10 +165,28 @@ pub fn init(config: Config, allocator: std.mem.Allocator) !void {
     }
 }
 
-pub fn install(server: anytype, cfg: InitConfig, allocator: std.mem.Allocator) !void {
+/// Configures the providers, starts the sign-in workers and registers the
+/// routes. `gpa` must be threadsafe: sign-ins allocate from it on the
+/// workers. Call `deinit` once the server's `listen` has returned and
+/// before its `deinit`.
+pub fn install(server: anytype, cfg: InitConfig, gpa: std.mem.Allocator, io: std.Io) !void {
     api_config = cfg;
-    try init(try buildConfig(cfg, allocator), allocator);
+    try init(try buildConfig(cfg, gpa), gpa);
+    if (google_initialized) {
+        job_allocator = gpa;
+        try pool.init(gpa, io, .{ .threads = cfg.sign_in_threads, .queue = cfg.sign_in_queue });
+        pool_running = true;
+    }
+    errdefer deinit();
     try registerRoutes(server);
+}
+
+/// Stops the sign-in workers. Sign-ins already queued finish and send
+/// their replies first.
+pub fn deinit() void {
+    if (!pool_running) return;
+    pool.deinit();
+    pool_running = false;
 }
 
 pub fn registerRoutes(server: anytype) !void {
@@ -255,22 +285,6 @@ pub const ExchangeSessionResponse = struct {
     },
 };
 
-// Login with google
-// send auth-code
-// receive code and exchange for access and refresh token
-// store refresh token in db hashed
-// set cookie with refresh token
-// compare with cookie token on request
-pub fn exchangeGoogleToken(ctx: *Context) !Google.TokenResp {
-    if (!google_initialized) return error.ProviderNotConfigured;
-    try ctx.parseForm();
-    try validateCallbackPayload(ctx);
-    const auth_code = ctx.form_params.get("auth-code") orelse return error.AuthCodeNull;
-    const allocator = ctx.requestAllocator();
-    const body = try google_provider.tokenExchange(allocator, auth_code);
-    return Google.parseResp(Google.TokenResp, body, allocator);
-}
-
 // Login with github
 // send auth-code
 // receive code and exchange for access and refresh token
@@ -340,20 +354,125 @@ pub const SessionClaims = struct {
     iat: i64,
 };
 
-pub fn exchangeGoogleCodeToSession(ctx: *Context) !AuthSessionResponse {
-    const tokens = try exchangeGoogleToken(ctx);
-    const id_token = tokens.id_token orelse return error.MissingIdToken;
-    const google = try handleGoogleCallback(ctx.requestAllocator(), id_token);
-    const session = try startSession(ctx, google.claims, tokens.refresh_token);
-    try clearCallbackCookies(ctx);
-    return .{ .success = true, .state = .signed_in, .session = session };
+// ---------------------------------------------------------------------------
+// Sign-in and refresh, on worker threads
+//
+// Both wait on Google for a few hundred milliseconds. Their routes check
+// what they can on the loop thread and defer the reply; a worker calls
+// Google, runs the app's `on_sign_in`, signs the session and sends the
+// reply with its cookies.
+// ---------------------------------------------------------------------------
+
+const Job = struct {
+    reply: *Reply,
+    kind: enum { exchange, refresh },
+    /// The authorization code, or the refresh token. Owned by the job.
+    grant: []u8,
+};
+
+const Pool = Workers(Job, runJob);
+var pool: Pool = undefined;
+var pool_running = false;
+var job_allocator: std.mem.Allocator = undefined;
+
+const json_type = "application/json";
+
+/// What a worker answers.
+const Outcome = struct {
+    status: u16,
+    content_type: []const u8 = json_type,
+    body: []const u8,
+    cookies: []const Cookie = &.{},
+};
+
+fn runJob(job: Job) void {
+    defer job_allocator.free(job.grant);
+    var arena: std.heap.ArenaAllocator = .init(job_allocator);
+    defer arena.deinit();
+    const outcome = switch (job.kind) {
+        .exchange => signIn(arena.allocator(), job.grant),
+        .refresh => refresh(arena.allocator(), job.grant),
+    };
+    job.reply.sendWithCookies(outcome.status, outcome.content_type, outcome.body, outcome.cookies);
 }
 
+fn signIn(arena: std.mem.Allocator, code: []const u8) Outcome {
+    const issued = exchangeCode(arena, code) catch |err| return refusal(err);
+    const session = issued.session;
+    const body = std.json.Stringify.valueAlloc(arena, ExchangeSessionResponse{
+        .success = true,
+        .state = .signed_in,
+        .token = session.token,
+        .issued_at = session.issued_at,
+        .expires_at = session.expires_at,
+        .user = .{
+            .id = session.user.id,
+            .email = session.user.email,
+            .name = session.user.name,
+            .picture = session.user.picture,
+        },
+    }, .{}) catch |err| return refusal(err);
+    return .{ .status = 200, .body = body, .cookies = issued.cookies };
+}
+
+/// The session for the user behind `code`, and the cookies that carry it.
+fn exchangeCode(arena: std.mem.Allocator, code: []const u8) !Issued {
+    const body = try google_provider.tokenExchange(arena, code);
+    const tokens = try Google.parseResp(Google.TokenResp, body, arena);
+    const id_token = tokens.id_token orelse return error.MissingIdToken;
+    const google = try handleGoogleCallback(arena, id_token);
+    return issueSession(arena, google.claims, tokens.refresh_token, true);
+}
+
+fn refresh(arena: std.mem.Allocator, refresh_token: []const u8) Outcome {
+    const body = refreshToken(.google, arena, refresh_token) catch |err| switch (err) {
+        // Revoked or expired: the user has to sign in again.
+        error.WrongStatusResponse => return signedOut(arena, "refresh_rejected"),
+        else => return refusal(err),
+    };
+    const refreshed = Google.parseResp(Google.RefreshTokenResp, body, arena) catch |err| return refusal(err);
+    const id_token = refreshed.id_token orelse return signedOut(arena, "refresh_id_token_missing");
+    const google = handleGoogleCallback(arena, id_token) catch |err| return refusal(err);
+    const issued = issueSession(arena, google.claims, null, false) catch |err| return refusal(err);
+    const response: AuthSessionResponse = .{ .success = true, .state = .signed_in, .session = issued.session };
+    const json = std.json.Stringify.valueAlloc(arena, response, .{}) catch |err| return refusal(err);
+    return .{ .status = 200, .body = json, .cookies = issued.cookies };
+}
+
+fn signedOut(arena: std.mem.Allocator, reason: []const u8) Outcome {
+    const response: AuthSessionResponse = .{ .success = false, .state = .signed_out, .err = reason };
+    const json = std.json.Stringify.valueAlloc(arena, response, .{}) catch |err| return refusal(err);
+    return .{ .status = 200, .body = json };
+}
+
+/// Refused by Google, or by the checks on what came back: the user can try
+/// again. Anything else is the server's problem.
+fn refusal(err: anyerror) Outcome {
+    const status: u16 = switch (err) {
+        error.WrongStatusResponse,
+        error.MissingIdToken,
+        error.InvalidIdToken,
+        => 401,
+        else => 500,
+    };
+    if (status == 401) {
+        std.log.warn("google sign-in refused: {any}", .{err});
+    } else {
+        std.log.err("google sign-in: {any}", .{err});
+    }
+    return .{ .status = status, .content_type = "text/plain", .body = "Google sign-in failed" };
+}
+
+const Issued = struct {
+    session: SessionInfo,
+    cookies: []const Cookie,
+};
+
 /// Issues a session for the user Google vouched for: runs the app's
-/// `on_sign_in`, signs the session token and sets the cookies (the refresh
-/// token's too, when Google sent one).
-fn startSession(ctx: *Context, google: GoogleClaims, refresh_token: ?[]const u8) !SessionInfo {
-    const allocator = ctx.requestAllocator();
+/// `on_sign_in`, signs the session token, and lists the cookies to set --
+/// the session, Google's refresh token when it sent one, and at sign-in
+/// the spent OAuth guards, cleared.
+fn issueSession(arena: std.mem.Allocator, google: GoogleClaims, refresh_token: ?[]const u8, clear_guards: bool) !Issued {
     const user: SignedIn = .{
         .provider = .google,
         .subject = google.sub,
@@ -362,25 +481,62 @@ fn startSession(ctx: *Context, google: GoogleClaims, refresh_token: ?[]const u8)
         .name = google.name,
         .picture = google.picture,
     };
-    const user_id = if (keystone_config.on_sign_in) |hook| try hook(allocator, user) else user.subject;
+    const user_id = if (keystone_config.on_sign_in) |hook| try hook(arena, user) else user.subject;
 
     const issued_at = Time.timestamp();
     const expires_at = issued_at + keystone_config.session_ttl_seconds;
     const name = google.name orelse "User";
-    const token = try encodeSessionToken(allocator, .{
+    const token = try encodeSessionToken(arena, .{
         .sub = user_id,
         .email = google.email,
         .name = name,
         .iat = issued_at,
         .exp = expires_at,
     });
-    try persistSessionCookies(ctx, token, refresh_token);
+
+    var cookies: std.ArrayList(Cookie) = .empty;
+    try cookies.append(arena, sessionCookie(keystone_config.session_cookie_name, token, keystone_config.session_ttl_seconds));
+    if (refresh_token) |value| {
+        try cookies.append(arena, sessionCookie(keystone_config.refresh_cookie_name, value, 60 * 60 * 24 * 30));
+    }
+    if (clear_guards) {
+        try cookies.append(arena, sessionCookie(keystone_config.oauth_state_cookie_name, "", 0));
+        try cookies.append(arena, sessionCookie(keystone_config.oauth_nonce_cookie_name, "", 0));
+    }
     return .{
-        .token = token,
-        .provider = .google,
-        .issued_at = issued_at,
-        .expires_at = expires_at,
-        .user = .{ .id = user_id, .email = google.email, .name = name, .picture = google.picture },
+        .session = .{
+            .token = token,
+            .provider = .google,
+            .issued_at = issued_at,
+            .expires_at = expires_at,
+            .user = .{ .id = user_id, .email = google.email, .name = name, .picture = google.picture },
+        },
+        .cookies = cookies.items,
+    };
+}
+
+/// A cookie with this package's attributes. An empty value with a zero
+/// lifetime clears it.
+fn sessionCookie(name: []const u8, value: []const u8, max_age: i64) Cookie {
+    return .{
+        .name = name,
+        .value = value,
+        .expires = max_age,
+        .http_only = keystone_config.http_only_cookies,
+        .secure = keystone_config.secure_cookies,
+        .same_site = keystone_config.same_site,
+    };
+}
+
+/// Hands a sign-in or refresh to a worker. The reply is the worker's from
+/// here; a full queue answers 503 at once.
+fn deferToWorker(ctx: *Context, kind: @FieldType(Job, "kind"), grant: []const u8) !void {
+    const owned = try job_allocator.dupe(u8, grant);
+    errdefer job_allocator.free(owned);
+    const reply = try ctx.deferReply();
+    pool.submit(.{ .reply = reply, .kind = kind, .grant = owned }) catch {
+        job_allocator.free(owned);
+        reply.send(503, "text/plain", "too many sign-ins at once; try again shortly");
     };
 }
 
@@ -407,30 +563,6 @@ pub fn bootstrapSession(ctx: *Context) !AuthSessionResponse {
             },
         },
     };
-}
-
-pub fn refreshSession(ctx: *Context) !AuthSessionResponse {
-    const refresh_token = try getRefreshToken(ctx) orelse return .{
-        .success = false,
-        .state = .signed_out,
-        .err = "refresh_token_missing",
-    };
-
-    const allocator = ctx.requestAllocator();
-    const body = refreshToken(.google, allocator, refresh_token) catch |err| switch (err) {
-        // Revoked or expired: the user has to sign in again.
-        error.WrongStatusResponse => return .{ .success = false, .state = .signed_out, .err = "refresh_rejected" },
-        else => return err,
-    };
-    const refreshed = try Google.parseResp(Google.RefreshTokenResp, body, allocator);
-    const id_token = refreshed.id_token orelse return .{
-        .success = false,
-        .state = .signed_out,
-        .err = "refresh_id_token_missing",
-    };
-
-    const google = try handleGoogleCallback(allocator, id_token);
-    return .{ .success = true, .state = .signed_in, .session = try startSession(ctx, google.claims, null) };
 }
 
 pub fn signOutSession(ctx: *Context, _: bool) !AuthSessionResponse {
@@ -512,26 +644,6 @@ fn encodeSessionToken(allocator: std.mem.Allocator, claims: SessionClaims) ![]co
     );
 }
 
-fn persistSessionCookies(ctx: *Context, session_token: []const u8, refresh_token: ?[]const u8) !void {
-    try ctx.addCookie(Cookie.Self{
-        .name = keystone_config.session_cookie_name,
-        .value = session_token,
-        .expires = keystone_config.session_ttl_seconds,
-        .http_only = keystone_config.http_only_cookies,
-        .secure = keystone_config.secure_cookies,
-    });
-
-    if (refresh_token) |token| {
-        try ctx.addCookie(Cookie.Self{
-            .name = keystone_config.refresh_cookie_name,
-            .value = token,
-            .expires = 60 * 60 * 24 * 30,
-            .http_only = keystone_config.http_only_cookies,
-            .secure = keystone_config.secure_cookies,
-        });
-    }
-}
-
 fn getRefreshToken(ctx: *Context) !?[]const u8 {
     if (ctx.http_header.content_type == .Form) {
         ctx.parseForm() catch {};
@@ -567,15 +679,13 @@ fn validateCallbackPayload(ctx: *Context) !void {
     }
 }
 
-fn clearCallbackCookies(ctx: *Context) !void {
-    try ctx.removeCookie(keystone_config.oauth_state_cookie_name);
-    try ctx.removeCookie(keystone_config.oauth_nonce_cookie_name);
-}
-
 fn clearSessionCookies(ctx: *Context) !void {
-    try ctx.removeCookie(keystone_config.session_cookie_name);
-    try ctx.removeCookie(keystone_config.refresh_cookie_name);
-    try clearCallbackCookies(ctx);
+    for ([_][]const u8{
+        keystone_config.session_cookie_name,
+        keystone_config.refresh_cookie_name,
+        keystone_config.oauth_state_cookie_name,
+        keystone_config.oauth_nonce_cookie_name,
+    }) |name| try ctx.addCookie(sessionCookie(name, "", 0));
 }
 
 fn buildConfig(init_cfg: InitConfig, allocator: std.mem.Allocator) !Config {
@@ -588,6 +698,7 @@ fn buildConfig(init_cfg: InitConfig, allocator: std.mem.Allocator) !Config {
         .oauth_nonce_cookie_name = init_cfg.oauth_nonce_cookie_name,
         .secure_cookies = init_cfg.secure_cookies,
         .http_only_cookies = init_cfg.http_only_cookies,
+        .same_site = init_cfg.same_site,
         .on_sign_in = init_cfg.on_sign_in,
     };
 
@@ -623,41 +734,14 @@ fn defaultRedirectUri(allocator: std.mem.Allocator, init_cfg: InitConfig) ![]con
 }
 
 fn routeGoogleExchange(ctx: *Context) !void {
-    const auth_resp = exchangeGoogleCodeToSession(ctx) catch |err| {
-        // Refused by Google, or by the checks on what came back: the user
-        // can try again. Anything else is the server's problem.
-        const status: u16 = switch (err) {
-            error.WrongStatusResponse,
-            error.InvalidOauthState,
-            error.InvalidOauthNonce,
-            error.OauthCallbackError,
-            error.AuthCodeNull,
-            error.MissingIdToken,
-            error.InvalidIdToken,
-            => 401,
-            else => 500,
-        };
-        if (status == 401) {
-            std.log.warn("google sign-in refused: {any}", .{err});
-        } else {
-            std.log.err("google sign-in: {any}", .{err});
-        }
-        return ctx.ERROR(status, "Google sign-in failed");
+    // The quick checks, here on the loop: what the browser sent back.
+    ctx.parseForm() catch return ctx.ERROR(400, "expected a form");
+    validateCallbackPayload(ctx) catch |err| {
+        std.log.warn("google sign-in refused: {any}", .{err});
+        return ctx.ERROR(401, "Google sign-in failed");
     };
-    const session = auth_resp.session orelse return error.InvalidSession;
-    try ctx.JSON(ExchangeSessionResponse, .{
-        .success = auth_resp.success,
-        .state = auth_resp.state,
-        .token = session.token,
-        .issued_at = session.issued_at,
-        .expires_at = session.expires_at,
-        .user = .{
-            .id = session.user.id,
-            .email = session.user.email,
-            .name = session.user.name,
-            .picture = session.user.picture,
-        },
-    });
+    const code = ctx.form_params.get("auth-code") orelse return ctx.ERROR(401, "Google sign-in failed");
+    try deferToWorker(ctx, .exchange, code);
 }
 
 fn routeGithubExchange(ctx: *Context) !void {
@@ -678,8 +762,12 @@ fn routeBootstrapSession(ctx: *Context) !void {
 }
 
 fn routeRefreshSession(ctx: *Context) !void {
-    const resp = try refreshSession(ctx);
-    try ctx.JSON(AuthSessionResponse, resp);
+    const refresh_token = try getRefreshToken(ctx) orelse return ctx.JSON(AuthSessionResponse, .{
+        .success = false,
+        .state = .signed_out,
+        .err = "refresh_token_missing",
+    });
+    try deferToWorker(ctx, .refresh, refresh_token);
 }
 
 fn routeSignoutSession(ctx: *Context) !void {

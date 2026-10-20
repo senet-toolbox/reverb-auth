@@ -7,8 +7,8 @@
         // Pinned to the reverb an app uses with this package, so the two
         // resolve to one reverb and share its `Context`.
         .reverb = .{
-            .url = "git+https://github.com/senet-toolbox/reverb#07ccfa87f4d029c77b6a3f23a295419866959ff1",
-            .hash = "reverb-0.0.0-Gtb4yb6CDABgzDg936pQAASJQtbtYU3poXj9XN-SjO-l",
+            .url = "git+https://github.com/senet-toolbox/reverb#f5ec29adb64af6c85c5f51abf91b0f2f522d7b91",
+            .hash = "reverb-0.0.0-Gtb4yV6PDABcJg5RC85-5kpQLv9A2gyDXi9FUqE_vuvD",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "LICENSE", "README.md" },

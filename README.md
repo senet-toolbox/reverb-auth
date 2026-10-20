@@ -52,11 +52,18 @@ be treated as forgeable.
 Reworked for assembler-backend, the first app to run it:
 
 - `KeyStone.install(server, .{ .clients = .{ .google = ... }, .session_secret
-  = ..., .on_sign_in = hook })` registers `/exchange/google/token`,
+  = ..., .on_sign_in = hook }, gpa, io)` registers `/exchange/google/token`,
   `/auth/session/{bootstrap,refresh,signout}` and
   `/auth/validate/google/session`, the routes vapor's KeyStone calls.
 - `on_sign_in` gets the user Google vouched for and returns the id the
   session is issued for, so the app can store the user.
+- Sign-in and refresh wait on Google, so they run on worker threads
+  (`sign_in_threads`, `sign_in_queue`; a full queue answers 503) and
+  answer through reverb's deferred replies. `install` takes a threadsafe
+  allocator and an `Io` for them; call `KeyStone.deinit()` after the
+  server's `listen` returns and before its `deinit`. `on_sign_in` runs on
+  those threads.
+- Session cookies carry `SameSite` (`same_site`, default `lax`).
 - Google's id token is refused unless it names this client as its
   audience, Google as its issuer, and has not expired. Its signature is not
   checked; it comes straight from Google over TLS (OpenID Connect Core
