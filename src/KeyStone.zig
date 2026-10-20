@@ -624,7 +624,6 @@ fn defaultRedirectUri(allocator: std.mem.Allocator, init_cfg: InitConfig) ![]con
 
 fn routeGoogleExchange(ctx: *Context) !void {
     const auth_resp = exchangeGoogleCodeToSession(ctx) catch |err| {
-        std.log.err("google sign-in: {any}", .{err});
         // Refused by Google, or by the checks on what came back: the user
         // can try again. Anything else is the server's problem.
         const status: u16 = switch (err) {
@@ -638,6 +637,11 @@ fn routeGoogleExchange(ctx: *Context) !void {
             => 401,
             else => 500,
         };
+        if (status == 401) {
+            std.log.warn("google sign-in refused: {any}", .{err});
+        } else {
+            std.log.err("google sign-in: {any}", .{err});
+        }
         return ctx.ERROR(status, "Google sign-in failed");
     };
     const session = auth_resp.session orelse return error.InvalidSession;
